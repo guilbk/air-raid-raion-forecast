@@ -7,3 +7,5 @@ plotly
 folium
 streamlit-folium
 requests
+python-dotenv
+joblib
