@@ -1,11 +1,24 @@
 import os
+import json
+import time
 from pathlib import Path
-from typing import Optional, Tuple
+from datetime import datetime, timezone
 
+import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+
+try:
+    import requests
+except ImportError:
+    requests = None
+
+try:
+    import joblib
+except ImportError:
+    joblib = None
 
 try:
     from dotenv import load_dotenv
@@ -13,15 +26,16 @@ except ImportError:
     load_dotenv = None
 
 try:
-    import requests
+    from streamlit_autorefresh import st_autorefresh
 except ImportError:
-    requests = None
+    st_autorefresh = None
 
 
 APP_TITLE = "Air Raid Raion Forecast"
 TARGET_NAME = "target_start_60m"
+LIVE_REFRESH_MINUTES = 15
 
-DATA_PATHS = {
+DATA = {
     "metrics": Path("data/processed/final_model_metrics.csv"),
     "comparison": Path("data/processed/final_model_comparison.csv"),
     "latest_risk": Path("data/processed/latest_risk_snapshot.csv"),
@@ -31,6 +45,28 @@ DATA_PATHS = {
     "intervals": Path("data/interim/raion_alert_intervals.csv"),
 }
 
+MODEL_PATHS = [
+    Path("data/processed/logistic_v3_final_model.joblib"),
+    Path("data/processed/logistic_v3_final.joblib"),
+    Path("data/processed/logistic_v3_final.pkl"),
+    Path("data/processed/logistic_v3_model.joblib"),
+    Path("models/logistic_v3_final.joblib"),
+    Path("models/logistic_v3_final.pkl"),
+]
+
+FEATURE_PATHS = [
+    Path("data/processed/logistic_v3_feature_columns.json"),
+    Path("data/processed/logistic_v3_feature_columns.txt"),
+    Path("data/processed/final_feature_columns.json"),
+    Path("data/processed/final_feature_columns.txt"),
+]
+
+LIVE_DIR = Path("data/live")
+LIVE_DIR.mkdir(parents=True, exist_ok=True)
+
+LIVE_SNAPSHOT_PATH = LIVE_DIR / "live_raion_snapshots.csv"
+LIVE_RISK_PATH = LIVE_DIR / "live_risk_snapshot.csv"
+LIVE_RAW_LAST_PATH = LIVE_DIR / "live_api_last_response.json"
 
 OBLAST_COORDS = {
     "Вінницька область": (49.2328, 28.4810),
@@ -60,6 +96,21 @@ OBLAST_COORDS = {
     "м. Київ": (50.4501, 30.5234),
 }
 
+FALLBACK_NUMERIC_FEATURES = [
+    "hour",
+    "day_of_week",
+    "is_weekend",
+    "is_night",
+    "starts_last_1h",
+    "starts_last_3h",
+    "starts_last_24h",
+    "active_minutes_last_1h",
+    "active_minutes_last_3h",
+    "active_minutes_last_24h",
+    "oblast_active_raions_now",
+    "oblast_active_share_now",
+]
+
 
 st.set_page_config(
     page_title=APP_TITLE,
@@ -68,104 +119,97 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-
 st.markdown(
     """
 <style>
-    .stApp {
-        background: radial-gradient(circle at top, #172033 0%, #0b0f17 45%, #06080d 100%);
-        color: #e8edf7;
-    }
-
-    [data-testid="stSidebar"] {
-        background: #080d14;
-        border-right: 1px solid #1f2b3d;
-    }
-
-    .main-card {
-        background: rgba(13, 20, 32, 0.92);
-        border: 1px solid rgba(92, 124, 173, 0.25);
-        border-radius: 18px;
-        padding: 18px;
-        margin-bottom: 14px;
-        box-shadow: 0 0 22px rgba(0, 0, 0, 0.24);
-    }
-
-    .small-note {
-        color: #9fb0c9;
-        font-size: 0.92rem;
-        line-height: 1.45;
-    }
-
-    .warning-box {
-        background: rgba(245, 158, 11, 0.10);
-        border: 1px solid rgba(245, 158, 11, 0.35);
-        border-radius: 14px;
-        padding: 14px;
-        color: #ffe6b3;
-    }
-
-    .risk-low {
-        color: #22c55e;
-        font-weight: 700;
-    }
-
-    .risk-medium {
-        color: #eab308;
-        font-weight: 700;
-    }
-
-    .risk-high {
-        color: #f97316;
-        font-weight: 700;
-    }
-
-    .risk-very-high {
-        color: #ef4444;
-        font-weight: 700;
-    }
-
-    div[data-testid="stMetric"] {
-        background: rgba(15, 23, 42, 0.92);
-        border: 1px solid rgba(148, 163, 184, 0.18);
-        padding: 14px;
-        border-radius: 16px;
-    }
+.stApp {
+    background: radial-gradient(circle at top, #172033 0%, #0b0f17 48%, #06080d 100%);
+    color: #e8edf7;
+}
+[data-testid="stSidebar"] {
+    background: #080d14;
+    border-right: 1px solid #1f2b3d;
+}
+.main-card {
+    background: rgba(13, 20, 32, 0.92);
+    border: 1px solid rgba(92, 124, 173, 0.25);
+    border-radius: 18px;
+    padding: 18px;
+    margin-bottom: 14px;
+    box-shadow: 0 0 22px rgba(0, 0, 0, 0.24);
+}
+.warning-box {
+    background: rgba(245, 158, 11, 0.10);
+    border: 1px solid rgba(245, 158, 11, 0.35);
+    border-radius: 14px;
+    padding: 14px;
+    color: #ffe6b3;
+}
+.danger-box {
+    background: rgba(239, 68, 68, 0.10);
+    border: 1px solid rgba(239, 68, 68, 0.35);
+    border-radius: 14px;
+    padding: 14px;
+    color: #fecaca;
+}
+.small-note {
+    color: #9fb0c9;
+    font-size: 0.92rem;
+    line-height: 1.45;
+}
+.risk-low {color: #22c55e; font-weight: 800;}
+.risk-medium {color: #eab308; font-weight: 800;}
+.risk-high {color: #f97316; font-weight: 800;}
+.risk-very-high {color: #ef4444; font-weight: 800;}
+div[data-testid="stMetric"] {
+    background: rgba(15, 23, 42, 0.92);
+    border: 1px solid rgba(148, 163, 184, 0.18);
+    padding: 14px;
+    border-radius: 16px;
+}
 </style>
 """,
     unsafe_allow_html=True,
 )
 
 
-def safe_read_csv(path: Path, name: str) -> Tuple[pd.DataFrame, Optional[str]]:
+def read_csv_safe(path: Path, usecols=None) -> tuple[pd.DataFrame, str | None]:
     if not path.exists():
-        return pd.DataFrame(), f"Файл не знайдено: `{path}`"
+        return pd.DataFrame(), f"Файл не знайдено: {path}"
     try:
-        return pd.read_csv(path), None
+        return pd.read_csv(path, usecols=usecols), None
     except Exception as exc:
-        return pd.DataFrame(), f"Не вдалося прочитати `{path}`: {exc}"
+        return pd.DataFrame(), f"Не вдалося прочитати {path}: {exc}"
 
 
 @st.cache_data(show_spinner=False)
-def load_all_data():
+def load_static_data():
     data = {}
     errors = []
-    for key, path in DATA_PATHS.items():
-        df, error = safe_read_csv(path, key)
+
+    for key, path in DATA.items():
+        df, error = read_csv_safe(path)
         data[key] = df
         if error:
             errors.append(error)
+
     return data, errors
 
 
-def find_col(df: pd.DataFrame, candidates: list[str]) -> Optional[str]:
+def normalize_text(x) -> str:
+    if pd.isna(x):
+        return ""
+    return str(x).strip()
+
+
+def find_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
     for col in candidates:
         if col in df.columns:
             return col
     return None
 
 
-def get_risk_col(df: pd.DataFrame) -> Optional[str]:
+def get_risk_col(df: pd.DataFrame) -> str | None:
     return find_col(
         df,
         [
@@ -180,8 +224,10 @@ def get_risk_col(df: pd.DataFrame) -> Optional[str]:
     )
 
 
-def risk_level_from_score(score: float) -> str:
-    if pd.isna(score):
+def risk_level(score) -> str:
+    try:
+        score = float(score)
+    except Exception:
         return "unknown"
     if score < 0.25:
         return "low"
@@ -192,56 +238,81 @@ def risk_level_from_score(score: float) -> str:
     return "very_high"
 
 
-def risk_level_ua(level: str) -> str:
-    mapping = {
+def risk_ua(level: str) -> str:
+    return {
         "low": "низький",
         "medium": "середній",
         "high": "високий",
         "very_high": "дуже високий",
+        "already_active": "тривога активна",
         "unknown": "невідомо",
-    }
-    return mapping.get(str(level), str(level))
+    }.get(str(level), str(level))
 
 
-def risk_html(level: str, text: Optional[str] = None) -> str:
-    level = str(level)
-    label = text or risk_level_ua(level)
+def risk_html(level: str, text: str | None = None) -> str:
     css = {
         "low": "risk-low",
         "medium": "risk-medium",
         "high": "risk-high",
         "very_high": "risk-very-high",
-    }.get(level, "")
-    return f'<span class="{css}">{label}</span>'
+        "already_active": "risk-very-high",
+    }.get(str(level), "")
+    return f'<span class="{css}">{text or risk_ua(level)}</span>'
+
+
+def fmt_score(x) -> str:
+    try:
+        if pd.isna(x):
+            return "—"
+        return f"{float(x):.3f}"
+    except Exception:
+        return "—"
+
+
+def fmt_pct(x) -> str:
+    try:
+        if pd.isna(x):
+            return "—"
+        return f"{float(x) * 100:.1f}%"
+    except Exception:
+        return "—"
+
+
+def floor_to_15min_utc(dt: datetime | None = None) -> pd.Timestamp:
+    if dt is None:
+        dt = datetime.now(timezone.utc)
+    ts = pd.Timestamp(dt).tz_convert("UTC") if pd.Timestamp(dt).tzinfo else pd.Timestamp(dt, tz="UTC")
+    minute = (ts.minute // 15) * 15
+    return ts.replace(minute=minute, second=0, microsecond=0)
 
 
 def prepare_latest_risk(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
 
-    df = df.copy()
-    risk_col = get_risk_col(df)
+    out = df.copy()
+    risk_col = get_risk_col(out)
 
-    if risk_col and risk_col != "risk_score":
-        df["risk_score"] = pd.to_numeric(df[risk_col], errors="coerce")
-    elif "risk_score" in df.columns:
-        df["risk_score"] = pd.to_numeric(df["risk_score"], errors="coerce")
+    if risk_col is not None and risk_col != "risk_score":
+        out["risk_score"] = pd.to_numeric(out[risk_col], errors="coerce")
+    elif "risk_score" in out.columns:
+        out["risk_score"] = pd.to_numeric(out["risk_score"], errors="coerce")
     else:
-        df["risk_score"] = pd.NA
+        out["risk_score"] = np.nan
 
-    if "risk_level" not in df.columns:
-        df["risk_level"] = df["risk_score"].apply(risk_level_from_score)
+    if "risk_level" not in out.columns:
+        out["risk_level"] = out["risk_score"].apply(risk_level)
 
-    if "risk_rank" not in df.columns:
-        df["risk_rank"] = df["risk_score"].rank(ascending=False, method="first").astype("Int64")
+    if "risk_rank" not in out.columns:
+        out["risk_rank"] = out["risk_score"].rank(ascending=False, method="first").astype("Int64")
 
-    if "risk_percentile" not in df.columns:
-        df["risk_percentile"] = df["risk_score"].rank(pct=True).fillna(0)
+    if "risk_percentile" not in out.columns:
+        out["risk_percentile"] = out["risk_score"].rank(pct=True)
 
-    if "timestamp" in df.columns:
-        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce", utc=True)
+    if "timestamp" in out.columns:
+        out["timestamp"] = pd.to_datetime(out["timestamp"], errors="coerce", utc=True)
 
-    return df
+    return out
 
 
 def prepare_risk_by_oblast(df: pd.DataFrame, latest_df: pd.DataFrame) -> pd.DataFrame:
@@ -257,7 +328,8 @@ def prepare_risk_by_oblast(df: pd.DataFrame, latest_df: pd.DataFrame) -> pd.Data
             )
         )
         if TARGET_NAME in latest_df.columns:
-            out["actual_positive_rate"] = latest_df.groupby("oblast")[TARGET_NAME].mean().values
+            actual = latest_df.groupby("oblast")[TARGET_NAME].mean().reset_index(name="actual_positive_rate")
+            out = out.merge(actual, on="oblast", how="left")
     else:
         return pd.DataFrame()
 
@@ -267,7 +339,7 @@ def prepare_risk_by_oblast(df: pd.DataFrame, latest_df: pd.DataFrame) -> pd.Data
             out["avg_predicted_risk"] = pd.to_numeric(out[risk_col], errors="coerce")
 
     if "actual_positive_rate" not in out.columns:
-        out["actual_positive_rate"] = pd.NA
+        out["actual_positive_rate"] = np.nan
 
     out["lat"] = out["oblast"].map(lambda x: OBLAST_COORDS.get(x, (None, None))[0])
     out["lon"] = out["oblast"].map(lambda x: OBLAST_COORDS.get(x, (None, None))[1])
@@ -281,9 +353,9 @@ def prepare_risk_by_hour(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
 
     if "hour" not in out.columns:
-        possible_hour_col = find_col(out, ["timestamp_hour", "time_hour"])
-        if possible_hour_col:
-            out["hour"] = out[possible_hour_col]
+        possible = find_col(out, ["timestamp_hour", "time_hour"])
+        if possible:
+            out["hour"] = out[possible]
 
     if "avg_predicted_risk" not in out.columns:
         risk_col = get_risk_col(out)
@@ -298,93 +370,512 @@ def prepare_risk_by_hour(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def load_live_alerts() -> Tuple[pd.DataFrame, str]:
+def build_raion_reference(latest_df: pd.DataFrame, intervals_df: pd.DataFrame) -> pd.DataFrame:
+    parts = []
+
+    if not latest_df.empty and {"oblast", "raion"}.issubset(latest_df.columns):
+        parts.append(latest_df[["oblast", "raion"]].dropna().drop_duplicates())
+
+    if not intervals_df.empty and {"oblast", "raion"}.issubset(intervals_df.columns):
+        parts.append(intervals_df[["oblast", "raion"]].dropna().drop_duplicates())
+
+    if not parts:
+        return pd.DataFrame(columns=["oblast", "raion"])
+
+    ref = pd.concat(parts, ignore_index=True).drop_duplicates()
+    ref["oblast"] = ref["oblast"].map(normalize_text)
+    ref["raion"] = ref["raion"].map(normalize_text)
+    ref = ref[(ref["oblast"] != "") & (ref["raion"] != "")]
+    return ref.sort_values(["oblast", "raion"]).reset_index(drop=True)
+
+
+def load_token() -> str | None:
     if load_dotenv is not None:
         load_dotenv()
-
     token = os.getenv("ALERTS_IN_UA_TOKEN")
+    if token:
+        return token.strip()
+    return None
+
+
+def fetch_active_alerts() -> tuple[pd.DataFrame, str]:
+    token = load_token()
 
     if not token:
-        return pd.DataFrame(), "live mode unavailable: ALERTS_IN_UA_TOKEN not found"
+        return pd.DataFrame(), "live unavailable: ALERTS_IN_UA_TOKEN не знайдено в .env"
 
     if requests is None:
-        return pd.DataFrame(), "live mode unavailable: package `requests` is not installed"
+        return pd.DataFrame(), "live unavailable: пакет requests не встановлено"
 
     url = "https://api.alerts.in.ua/v1/alerts/active.json"
 
     try:
-        response = requests.get(url, params={"token": token}, timeout=10)
+        response = requests.get(url, params={"token": token}, timeout=12)
         response.raise_for_status()
         payload = response.json()
-        alerts = payload.get("alerts", payload if isinstance(payload, list) else [])
-        return pd.DataFrame(alerts), "live mode available: active alerts loaded"
-    except Exception as exc:
-        return pd.DataFrame(), f"live mode unavailable: API request failed: {exc}"
 
-
-def format_percent(value) -> str:
-    try:
-        if pd.isna(value):
-            return "—"
-        return f"{float(value) * 100:.1f}%"
-    except Exception:
-        return "—"
-
-
-def format_score(value) -> str:
-    try:
-        if pd.isna(value):
-            return "—"
-        return f"{float(value):.3f}"
-    except Exception:
-        return "—"
-
-
-def metric_value(metrics_df: pd.DataFrame, name: str):
-    if metrics_df.empty or name not in metrics_df.columns:
-        return None
-    return metrics_df[name].iloc[0]
-
-
-def build_oblast_map(oblast_df: pd.DataFrame) -> go.Figure:
-    if oblast_df.empty or "avg_predicted_risk" not in oblast_df.columns:
-        fig = go.Figure()
-        fig.update_layout(
-            template="plotly_dark",
-            height=520,
-            title="Немає даних для панелі ризику областей",
+        LIVE_RAW_LAST_PATH.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
         )
+
+        if isinstance(payload, dict):
+            alerts = payload.get("alerts", [])
+        elif isinstance(payload, list):
+            alerts = payload
+        else:
+            alerts = []
+
+        df = pd.DataFrame(alerts)
+        return df, f"live ok: отримано активних alert records: {len(df)}"
+    except Exception as exc:
+        return pd.DataFrame(), f"live error: {exc}"
+
+
+def is_air_raid_alert(row: pd.Series) -> bool:
+    alert_type = normalize_text(row.get("alert_type", "")).lower()
+    alert_title = normalize_text(row.get("alert_type_title", "")).lower()
+    title = normalize_text(row.get("title", "")).lower()
+
+    if alert_type == "air_raid":
+        return True
+    if "повітря" in alert_title or "air" in alert_title:
+        return True
+    if "повітря" in title:
+        return True
+    return False
+
+
+def get_alert_location(row: pd.Series) -> tuple[str, str, str]:
+    location_type = normalize_text(row.get("location_type", "")).lower()
+
+    oblast = normalize_text(
+        row.get("location_oblast")
+        or row.get("oblast")
+        or row.get("region")
+        or ""
+    )
+
+    raion = normalize_text(
+        row.get("location_raion")
+        or row.get("raion")
+        or ""
+    )
+
+    title = normalize_text(
+        row.get("location_title")
+        or row.get("location")
+        or row.get("title")
+        or ""
+    )
+
+    if not oblast and "область" in title:
+        oblast = title
+
+    return location_type, oblast, raion
+
+
+def build_live_raion_snapshot(api_df: pd.DataFrame, raion_ref: pd.DataFrame, ts: pd.Timestamp) -> pd.DataFrame:
+    base = raion_ref.copy()
+    base["timestamp"] = ts
+    base["fetched_at"] = pd.Timestamp.now(tz="UTC")
+    base["direct_active"] = 0
+    base["inherited_active"] = 0
+    base["api_records_matched"] = 0
+
+    if api_df.empty or base.empty:
+        base["is_alert_active"] = 0
+        base["source_level_now"] = "none"
+        return base[
+            [
+                "timestamp",
+                "fetched_at",
+                "oblast",
+                "raion",
+                "is_alert_active",
+                "direct_active",
+                "inherited_active",
+                "source_level_now",
+                "api_records_matched",
+            ]
+        ]
+
+    air = api_df[api_df.apply(is_air_raid_alert, axis=1)].copy()
+
+    for _, alert in air.iterrows():
+        location_type, oblast, raion = get_alert_location(alert)
+
+        if location_type == "oblast" and oblast:
+            mask = base["oblast"] == oblast
+            base.loc[mask, "inherited_active"] = 1
+            base.loc[mask, "api_records_matched"] += 1
+            continue
+
+        if location_type in ["raion", "hromada", "city", "community"] and raion:
+            if oblast:
+                mask = (base["oblast"] == oblast) & (base["raion"] == raion)
+            else:
+                mask = base["raion"] == raion
+
+            if mask.any():
+                base.loc[mask, "direct_active"] = 1
+                base.loc[mask, "api_records_matched"] += 1
+            elif oblast:
+                mask_oblast = base["oblast"] == oblast
+                base.loc[mask_oblast, "inherited_active"] = 1
+                base.loc[mask_oblast, "api_records_matched"] += 1
+
+    base["is_alert_active"] = ((base["direct_active"] == 1) | (base["inherited_active"] == 1)).astype(int)
+
+    conditions = [
+        (base["direct_active"] == 0) & (base["inherited_active"] == 0),
+        (base["direct_active"] == 1) & (base["inherited_active"] == 0),
+        (base["direct_active"] == 0) & (base["inherited_active"] == 1),
+        (base["direct_active"] == 1) & (base["inherited_active"] == 1),
+    ]
+
+    choices = ["none", "direct_or_hromada", "oblast_inherited", "mixed"]
+    base["source_level_now"] = np.select(conditions, choices, default="none")
+
+    return base[
+        [
+            "timestamp",
+            "fetched_at",
+            "oblast",
+            "raion",
+            "is_alert_active",
+            "direct_active",
+            "inherited_active",
+            "source_level_now",
+            "api_records_matched",
+        ]
+    ]
+
+
+def read_live_log() -> pd.DataFrame:
+    if not LIVE_SNAPSHOT_PATH.exists():
+        return pd.DataFrame()
+
+    try:
+        df = pd.read_csv(LIVE_SNAPSHOT_PATH)
+        if "timestamp" in df.columns:
+            df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce", utc=True)
+        if "fetched_at" in df.columns:
+            df["fetched_at"] = pd.to_datetime(df["fetched_at"], errors="coerce", utc=True)
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+def append_live_snapshot(snapshot: pd.DataFrame):
+    if snapshot.empty:
+        return
+
+    existing = read_live_log()
+
+    combined = pd.concat([existing, snapshot], ignore_index=True)
+    combined["timestamp"] = pd.to_datetime(combined["timestamp"], errors="coerce", utc=True)
+    combined = combined.dropna(subset=["timestamp", "oblast", "raion"])
+
+    combined = combined.drop_duplicates(
+        subset=["timestamp", "oblast", "raion"],
+        keep="last",
+    )
+
+    combined = combined.sort_values(["timestamp", "oblast", "raion"])
+    combined.to_csv(LIVE_SNAPSHOT_PATH, index=False)
+
+
+def maybe_collect_live_snapshot(raion_ref: pd.DataFrame, force: bool = False) -> tuple[pd.DataFrame, str]:
+    ts = floor_to_15min_utc()
+    log = read_live_log()
+
+    if not force and not log.empty and "timestamp" in log.columns:
+        last_ts = log["timestamp"].max()
+        if pd.notna(last_ts) and last_ts >= ts:
+            latest = log[log["timestamp"] == last_ts].copy()
+            return latest, f"live cached: останній знімок уже є для {last_ts}"
+
+    api_df, status = fetch_active_alerts()
+
+    if "error" in status or "unavailable" in status:
+        if not log.empty and "timestamp" in log.columns:
+            last_ts = log["timestamp"].max()
+            latest = log[log["timestamp"] == last_ts].copy()
+            return latest, status + " | використано останній live log"
+        return pd.DataFrame(), status
+
+    snapshot = build_live_raion_snapshot(api_df, raion_ref, ts)
+    append_live_snapshot(snapshot)
+    return snapshot, status + f" | saved snapshot: {ts}"
+
+
+def compute_live_started_flags(log: pd.DataFrame) -> pd.DataFrame:
+    if log.empty:
+        return log
+
+    df = log.copy()
+    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce", utc=True)
+    df = df.dropna(subset=["timestamp"])
+    df = df.sort_values(["oblast", "raion", "timestamp"])
+
+    df["prev_active"] = df.groupby(["oblast", "raion"])["is_alert_active"].shift(1).fillna(0)
+    df["alert_started_now"] = ((df["is_alert_active"] == 1) & (df["prev_active"] == 0)).astype(int)
+    return df.drop(columns=["prev_active"])
+
+
+def build_live_features(current_snapshot: pd.DataFrame, full_log: pd.DataFrame) -> pd.DataFrame:
+    if current_snapshot.empty:
+        return pd.DataFrame()
+
+    current = current_snapshot.copy()
+    current["timestamp"] = pd.to_datetime(current["timestamp"], errors="coerce", utc=True)
+    current_ts = current["timestamp"].max()
+
+    log = compute_live_started_flags(full_log)
+    if log.empty:
+        log = current.copy()
+        log["alert_started_now"] = 0
+
+    log["timestamp"] = pd.to_datetime(log["timestamp"], errors="coerce", utc=True)
+    log = log.dropna(subset=["timestamp"])
+
+    current["hour"] = current_ts.hour
+    current["day_of_week"] = current_ts.dayofweek
+    current["is_weekend"] = int(current_ts.dayofweek >= 5)
+    current["is_night"] = int(current_ts.hour < 6 or current_ts.hour >= 22)
+
+    windows = {
+        "1h": 60,
+        "3h": 180,
+        "24h": 1440,
+    }
+
+    keys = ["oblast", "raion"]
+
+    for label, minutes in windows.items():
+        start_time = current_ts - pd.Timedelta(minutes=minutes)
+        recent = log[(log["timestamp"] > start_time) & (log["timestamp"] <= current_ts)].copy()
+
+        if recent.empty:
+            starts = pd.DataFrame(columns=keys + [f"starts_last_{label}"])
+            active = pd.DataFrame(columns=keys + [f"active_minutes_last_{label}"])
+        else:
+            starts = (
+                recent.groupby(keys, as_index=False)["alert_started_now"]
+                .sum()
+                .rename(columns={"alert_started_now": f"starts_last_{label}"})
+            )
+            active = (
+                recent.groupby(keys, as_index=False)["is_alert_active"]
+                .sum()
+                .rename(columns={"is_alert_active": f"active_minutes_last_{label}"})
+            )
+            active[f"active_minutes_last_{label}"] = active[f"active_minutes_last_{label}"] * 15
+
+        current = current.merge(starts, on=keys, how="left")
+        current = current.merge(active, on=keys, how="left")
+
+    for col in [
+        "starts_last_1h",
+        "starts_last_3h",
+        "starts_last_24h",
+        "active_minutes_last_1h",
+        "active_minutes_last_3h",
+        "active_minutes_last_24h",
+    ]:
+        if col not in current.columns:
+            current[col] = 0
+        current[col] = pd.to_numeric(current[col], errors="coerce").fillna(0)
+
+    oblast_stats = (
+        current.groupby("oblast", as_index=False)
+        .agg(
+            oblast_active_raions_now=("is_alert_active", "sum"),
+            oblast_total_raions=("raion", "count"),
+        )
+    )
+    oblast_stats["oblast_active_share_now"] = (
+        oblast_stats["oblast_active_raions_now"] / oblast_stats["oblast_total_raions"].replace(0, np.nan)
+    ).fillna(0)
+
+    current = current.merge(
+        oblast_stats[["oblast", "oblast_active_raions_now", "oblast_active_share_now"]],
+        on="oblast",
+        how="left",
+    )
+
+    current["live_history_hours_available"] = 0.0
+    if not log.empty:
+        min_ts = log["timestamp"].min()
+        current["live_history_hours_available"] = max((current_ts - min_ts).total_seconds() / 3600, 0)
+
+    return current
+
+
+def load_model():
+    if joblib is None:
+        return None, "joblib not installed"
+
+    for path in MODEL_PATHS:
+        if path.exists():
+            try:
+                return joblib.load(path), f"model loaded: {path}"
+            except Exception as exc:
+                return None, f"model load failed: {path}: {exc}"
+
+    return None, "model file not found, fallback risk scoring will be used"
+
+
+def load_feature_columns() -> list[str] | None:
+    for path in FEATURE_PATHS:
+        if not path.exists():
+            continue
+
+        try:
+            if path.suffix.lower() == ".json":
+                return json.loads(path.read_text(encoding="utf-8"))
+            if path.suffix.lower() == ".txt":
+                return [x.strip() for x in path.read_text(encoding="utf-8").splitlines() if x.strip()]
+        except Exception:
+            continue
+
+    return None
+
+
+def get_model_feature_columns(model, live_df: pd.DataFrame) -> list[str]:
+    explicit = load_feature_columns()
+    if explicit:
+        return explicit
+
+    if model is not None and hasattr(model, "feature_names_in_"):
+        return list(model.feature_names_in_)
+
+    cols = []
+    for col in ["oblast", "raion"] + FALLBACK_NUMERIC_FEATURES:
+        if col in live_df.columns:
+            cols.append(col)
+    return cols
+
+
+def fallback_risk_scores(live_df: pd.DataFrame, latest_df: pd.DataFrame, risk_by_oblast_df: pd.DataFrame) -> pd.Series:
+    df = live_df.copy()
+
+    base = pd.Series(0.10, index=df.index, dtype=float)
+
+    if not latest_df.empty and {"oblast", "raion", "risk_score"}.issubset(latest_df.columns):
+        prior = latest_df[["oblast", "raion", "risk_score"]].copy()
+        prior = prior.rename(columns={"risk_score": "historical_risk_prior"})
+        df = df.merge(prior, on=["oblast", "raion"], how="left")
+        base = df["historical_risk_prior"].fillna(base).astype(float)
+
+    elif not risk_by_oblast_df.empty and {"oblast", "avg_predicted_risk"}.issubset(risk_by_oblast_df.columns):
+        prior = risk_by_oblast_df[["oblast", "avg_predicted_risk"]].copy()
+        prior = prior.rename(columns={"avg_predicted_risk": "oblast_risk_prior"})
+        df = df.merge(prior, on="oblast", how="left")
+        base = df["oblast_risk_prior"].fillna(base).astype(float)
+
+    active_share = pd.to_numeric(live_df.get("oblast_active_share_now", 0), errors="coerce").fillna(0)
+    starts_3h = pd.to_numeric(live_df.get("starts_last_3h", 0), errors="coerce").fillna(0)
+    active_3h = pd.to_numeric(live_df.get("active_minutes_last_3h", 0), errors="coerce").fillna(0)
+    is_night = pd.to_numeric(live_df.get("is_night", 0), errors="coerce").fillna(0)
+
+    risk = (
+        0.55 * base
+        + 0.25 * active_share
+        + 0.04 * np.clip(starts_3h, 0, 3)
+        + 0.001 * np.clip(active_3h, 0, 180)
+        + 0.04 * is_night
+    )
+
+    return pd.Series(np.clip(risk, 0, 0.99), index=live_df.index)
+
+
+def predict_live_risk(
+    live_features: pd.DataFrame,
+    model,
+    model_status: str,
+    latest_df: pd.DataFrame,
+    risk_by_oblast_df: pd.DataFrame,
+) -> tuple[pd.DataFrame, str]:
+    if live_features.empty:
+        return pd.DataFrame(), "no live features"
+
+    out = live_features.copy()
+    out["risk_score"] = np.nan
+    out["prediction_mode"] = "fallback_momentary"
+
+    inactive_mask = out["is_alert_active"] == 0
+
+    if model is not None and inactive_mask.any():
+        feature_cols = get_model_feature_columns(model, out)
+
+        X = out.loc[inactive_mask].copy()
+
+        for col in feature_cols:
+            if col not in X.columns:
+                X[col] = 0
+
+        X_model = X[feature_cols].copy()
+
+        try:
+            if hasattr(model, "predict_proba"):
+                pred = model.predict_proba(X_model)[:, 1]
+            else:
+                pred = model.predict(X_model)
+                pred = np.asarray(pred).astype(float)
+
+            out.loc[inactive_mask, "risk_score"] = pred
+            out.loc[inactive_mask, "prediction_mode"] = "logistic_v3_live_features"
+            status = model_status + " | live prediction ok"
+        except Exception as exc:
+            pred = fallback_risk_scores(out.loc[inactive_mask], latest_df, risk_by_oblast_df)
+            out.loc[inactive_mask, "risk_score"] = pred.values
+            out.loc[inactive_mask, "prediction_mode"] = "fallback_after_model_error"
+            status = model_status + f" | model prediction failed: {exc} | fallback used"
+    else:
+        if inactive_mask.any():
+            pred = fallback_risk_scores(out.loc[inactive_mask], latest_df, risk_by_oblast_df)
+            out.loc[inactive_mask, "risk_score"] = pred.values
+        status = model_status + " | fallback used"
+
+    out.loc[out["is_alert_active"] == 1, "risk_score"] = np.nan
+    out.loc[out["is_alert_active"] == 1, "prediction_mode"] = "already_active_no_start_prediction"
+
+    out["risk_level"] = out["risk_score"].apply(risk_level)
+    out.loc[out["is_alert_active"] == 1, "risk_level"] = "already_active"
+
+    out["risk_rank"] = out["risk_score"].rank(ascending=False, method="first").astype("Int64")
+    out["risk_percentile"] = out["risk_score"].rank(pct=True)
+
+    out.to_csv(LIVE_RISK_PATH, index=False)
+    return out, status
+
+
+def build_oblast_panel(oblast_df: pd.DataFrame, value_col: str, title: str) -> go.Figure:
+    if oblast_df.empty or value_col not in oblast_df.columns:
+        fig = go.Figure()
+        fig.update_layout(template="plotly_dark", height=520, title="Немає даних")
         return fig
 
-    plot_df = oblast_df.dropna(subset=["avg_predicted_risk"]).copy()
+    df = oblast_df.copy()
+    df["lat"] = df["oblast"].map(lambda x: OBLAST_COORDS.get(x, (None, None))[0])
+    df["lon"] = df["oblast"].map(lambda x: OBLAST_COORDS.get(x, (None, None))[1])
 
-    if "lat" in plot_df.columns and "lon" in plot_df.columns and plot_df["lat"].notna().any():
+    geo_df = df.dropna(subset=["lat", "lon", value_col])
+
+    if not geo_df.empty:
         fig = px.scatter_geo(
-            plot_df,
+            geo_df,
             lat="lat",
             lon="lon",
             hover_name="oblast",
-            size="avg_predicted_risk",
-            color="avg_predicted_risk",
+            size=value_col,
+            color=value_col,
             color_continuous_scale=["#22c55e", "#eab308", "#f97316", "#ef4444"],
-            size_max=38,
+            size_max=42,
             projection="natural earth",
-            custom_data=[
-                "avg_predicted_risk",
-                "actual_positive_rate",
-                "max_predicted_risk" if "max_predicted_risk" in plot_df.columns else "avg_predicted_risk",
-            ],
         )
-
-        fig.update_traces(
-            hovertemplate=(
-                "<b>%{hovertext}</b><br>"
-                "Середній risk score: %{customdata[0]:.3f}<br>"
-                "Фактична частка позитивів: %{customdata[1]:.3f}<br>"
-                "Максимальний risk score: %{customdata[2]:.3f}<extra></extra>"
-            )
-        )
-
         fig.update_geos(
             visible=True,
             showcountries=True,
@@ -396,81 +887,143 @@ def build_oblast_map(oblast_df: pd.DataFrame) -> go.Figure:
             lataxis_range=[44, 53],
             lonaxis_range=[21, 41],
         )
-
         fig.update_layout(
             template="plotly_dark",
-            height=560,
-            margin=dict(l=0, r=0, t=35, b=0),
-            title="Панель ризику по областях",
-            coloraxis_colorbar=dict(title="Risk score"),
+            height=570,
+            title=title,
+            margin=dict(l=0, r=0, t=45, b=0),
+            coloraxis_colorbar=dict(title="score"),
         )
         return fig
 
-    top = plot_df.sort_values("avg_predicted_risk", ascending=True).tail(15)
+    top = df.sort_values(value_col, ascending=True).tail(15)
     fig = px.bar(
         top,
-        x="avg_predicted_risk",
+        x=value_col,
         y="oblast",
         orientation="h",
-        color="avg_predicted_risk",
+        color=value_col,
         color_continuous_scale=["#22c55e", "#eab308", "#f97316", "#ef4444"],
-        labels={"avg_predicted_risk": "Risk score", "oblast": "Область"},
-        title="Топ областей за середньою оцінкою ризику",
+        title=title,
     )
-    fig.update_layout(template="plotly_dark", height=560, margin=dict(l=0, r=0, t=45, b=0))
+    fig.update_layout(template="plotly_dark", height=570, margin=dict(l=0, r=0, t=45, b=0))
     return fig
 
 
-def build_top_raions_chart(latest_df: pd.DataFrame, top_n: int = 15) -> go.Figure:
-    if latest_df.empty or "risk_score" not in latest_df.columns:
+def build_live_oblast_summary(live_risk: pd.DataFrame) -> pd.DataFrame:
+    if live_risk.empty:
+        return pd.DataFrame()
+
+    inactive = live_risk[live_risk["is_alert_active"] == 0].copy()
+
+    risk_summary = (
+        inactive.groupby("oblast", as_index=False)
+        .agg(
+            avg_live_risk=("risk_score", "mean"),
+            max_live_risk=("risk_score", "max"),
+            inactive_raions=("raion", "count"),
+        )
+    )
+
+    active_summary = (
+        live_risk.groupby("oblast", as_index=False)
+        .agg(
+            active_raions=("is_alert_active", "sum"),
+            total_raions=("raion", "count"),
+        )
+    )
+
+    out = active_summary.merge(risk_summary, on="oblast", how="left")
+    out["active_share"] = out["active_raions"] / out["total_raions"].replace(0, np.nan)
+    return out
+
+
+def chart_top_live_risks(live_risk: pd.DataFrame, n: int = 20) -> go.Figure:
+    if live_risk.empty:
         fig = go.Figure()
-        fig.update_layout(template="plotly_dark", height=420, title="Немає даних про райони")
+        fig.update_layout(template="plotly_dark", height=520, title="Немає live predictions")
         return fig
 
-    top = latest_df.sort_values("risk_score", ascending=True).tail(top_n).copy()
-    top["label"] = top["oblast"].astype(str) + " · " + top["raion"].astype(str)
+    df = live_risk[live_risk["is_alert_active"] == 0].copy()
+    df = df.dropna(subset=["risk_score"]).sort_values("risk_score", ascending=True).tail(n)
+    df["label"] = df["oblast"] + " · " + df["raion"]
 
     fig = px.bar(
-        top,
+        df,
         x="risk_score",
         y="label",
         orientation="h",
         color="risk_score",
         color_continuous_scale=["#22c55e", "#eab308", "#f97316", "#ef4444"],
+        title=f"Топ-{n} районів за live risk score",
         labels={"risk_score": "Risk score", "label": "Район"},
-        title=f"Топ-{top_n} районів за оцінкою ризику",
     )
-    fig.update_layout(template="plotly_dark", height=520, margin=dict(l=0, r=0, t=45, b=0))
+    fig.update_layout(template="plotly_dark", height=620, margin=dict(l=0, r=0, t=45, b=0))
     return fig
 
 
-def build_hour_chart(hour_df: pd.DataFrame) -> go.Figure:
-    if hour_df.empty or "hour" not in hour_df.columns:
+def chart_live_active_history(log: pd.DataFrame) -> go.Figure:
+    if log.empty:
         fig = go.Figure()
-        fig.update_layout(template="plotly_dark", height=420, title="Немає даних по годинах")
+        fig.update_layout(template="plotly_dark", height=420, title="Live log ще порожній")
         return fig
 
-    plot_df = hour_df.copy()
-    plot_df["hour"] = pd.to_numeric(plot_df["hour"], errors="coerce")
-    plot_df = plot_df.dropna(subset=["hour"]).sort_values("hour")
+    df = log.copy()
+    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce", utc=True)
+
+    summary = (
+        df.groupby("timestamp", as_index=False)
+        .agg(
+            active_raions=("is_alert_active", "sum"),
+            direct_active=("direct_active", "sum"),
+            inherited_active=("inherited_active", "sum"),
+        )
+        .sort_values("timestamp")
+    )
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=summary["timestamp"], y=summary["active_raions"], mode="lines+markers", name="active raions"))
+    fig.add_trace(go.Scatter(x=summary["timestamp"], y=summary["direct_active"], mode="lines+markers", name="direct active"))
+    fig.add_trace(go.Scatter(x=summary["timestamp"], y=summary["inherited_active"], mode="lines+markers", name="inherited active"))
+
+    fig.update_layout(
+        template="plotly_dark",
+        height=420,
+        title="Live log: активні райони у часі",
+        xaxis_title="Timestamp",
+        yaxis_title="Кількість районів",
+        margin=dict(l=0, r=0, t=45, b=0),
+    )
+    return fig
+
+
+def chart_risk_by_hour(hour_df: pd.DataFrame) -> go.Figure:
+    if hour_df.empty or "hour" not in hour_df.columns:
+        fig = go.Figure()
+        fig.update_layout(template="plotly_dark", height=420, title="Немає risk_by_hour.csv")
+        return fig
+
+    df = hour_df.copy()
+    df["hour"] = pd.to_numeric(df["hour"], errors="coerce")
+    df = df.dropna(subset=["hour"]).sort_values("hour")
 
     fig = go.Figure()
 
-    if "avg_predicted_risk" in plot_df.columns:
+    if "avg_predicted_risk" in df.columns:
         fig.add_trace(
             go.Scatter(
-                x=plot_df["hour"],
-                y=plot_df["avg_predicted_risk"],
+                x=df["hour"],
+                y=df["avg_predicted_risk"],
                 mode="lines+markers",
                 name="Середній risk score",
             )
         )
 
-    if "actual_positive_rate" in plot_df.columns:
+    if "actual_positive_rate" in df.columns:
         fig.add_trace(
             go.Scatter(
-                x=plot_df["hour"],
-                y=plot_df["actual_positive_rate"],
+                x=df["hour"],
+                y=df["actual_positive_rate"],
                 mode="lines+markers",
                 name="Фактична частка позитивів",
             )
@@ -478,32 +1031,25 @@ def build_hour_chart(hour_df: pd.DataFrame) -> go.Figure:
 
     fig.update_layout(
         template="plotly_dark",
-        height=420,
-        title="Ризик і фактичні позитивні події по годинах доби",
-        xaxis_title="Година доби",
+        height=430,
+        title="Ризик і фактичні позитиви по годинах",
+        xaxis_title="Година",
         yaxis_title="Значення",
         margin=dict(l=0, r=0, t=45, b=0),
     )
     return fig
 
 
-def build_raion_hour_starts(intervals_df: pd.DataFrame, oblast: str, raion: str) -> go.Figure:
-    if intervals_df.empty:
+def chart_raion_hour_starts(intervals: pd.DataFrame, oblast: str, raion: str) -> go.Figure:
+    if intervals.empty or "started_at" not in intervals.columns:
         fig = go.Figure()
-        fig.update_layout(template="plotly_dark", height=420, title="Немає даних про тривоги району")
+        fig.update_layout(template="plotly_dark", height=420, title="Немає історії району")
         return fig
 
-    df = intervals_df.copy()
-    if "started_at" not in df.columns:
-        fig = go.Figure()
-        fig.update_layout(template="plotly_dark", height=420, title="У файлі немає started_at")
-        return fig
-
-    df = df[(df["oblast"] == oblast) & (df["raion"] == raion)].copy()
-
+    df = intervals[(intervals["oblast"] == oblast) & (intervals["raion"] == raion)].copy()
     if df.empty:
         fig = go.Figure()
-        fig.update_layout(template="plotly_dark", height=420, title="Для вибраного району немає інтервалів")
+        fig.update_layout(template="plotly_dark", height=420, title="Для району немає інтервалів")
         return fig
 
     df["started_at"] = pd.to_datetime(df["started_at"], errors="coerce", utc=True)
@@ -518,275 +1064,386 @@ def build_raion_hour_starts(intervals_df: pd.DataFrame, oblast: str, raion: str)
         counts,
         x="hour",
         y="size",
-        labels={"hour": "Година доби", "size": "Кількість стартів"},
         title=f"Старт тривог по годинах: {raion}",
+        labels={"hour": "Година доби", "size": "Кількість стартів"},
     )
     fig.update_layout(template="plotly_dark", height=420, margin=dict(l=0, r=0, t=45, b=0))
     return fig
 
 
-def show_missing_files(errors: list[str]):
-    if errors:
-        with st.expander("Файли, які не вдалося завантажити", expanded=False):
-            for error in errors:
-                st.warning(error)
+static_data, static_errors = load_static_data()
 
+metrics_df = static_data["metrics"]
+comparison_df = static_data["comparison"]
+latest_df = prepare_latest_risk(static_data["latest_risk"])
+intervals_df = static_data["intervals"]
+risk_by_oblast_df = prepare_risk_by_oblast(static_data["risk_by_oblast"], latest_df)
+risk_by_hour_df = prepare_risk_by_hour(static_data["risk_by_hour"])
+prediction_sample_df = static_data["prediction_sample"]
 
-data, load_errors = load_all_data()
+raion_ref = build_raion_reference(latest_df, intervals_df)
+model, model_status = load_model()
 
-metrics_df = data["metrics"]
-comparison_df = data["comparison"]
-latest_df = prepare_latest_risk(data["latest_risk"])
-risk_by_oblast_df = prepare_risk_by_oblast(data["risk_by_oblast"], latest_df)
-risk_by_hour_df = prepare_risk_by_hour(data["risk_by_hour"])
-prediction_sample_df = data["prediction_sample"]
-intervals_df = data["intervals"]
+st.sidebar.title("📡 Air Raid Forecast")
+st.sidebar.caption("Live + historical dashboard")
 
+auto_refresh = st.sidebar.checkbox("Автооновлення кожні 15 хв", value=True)
+force_refresh = st.sidebar.button("Оновити live зараз", type="primary")
 
-st.sidebar.title("📡 Навігація")
-st.sidebar.caption("Raion-level proxy alert forecast")
+if auto_refresh:
+    if st_autorefresh is not None:
+        st_autorefresh(interval=LIVE_REFRESH_MINUTES * 60 * 1000, key="live_autorefresh")
+    else:
+        st.sidebar.warning("Для автооновлення встанови streamlit-autorefresh. Зараз працює ручне оновлення.")
 
-mode = st.sidebar.radio(
-    "Режим",
-    ["Історичний знімок", "Live API"],
-    index=0,
-)
+if static_errors:
+    with st.sidebar.expander("Проблеми з файлами"):
+        for err in static_errors:
+            st.warning(err)
 
-live_df, live_status = load_live_alerts()
+live_snapshot, live_status = maybe_collect_live_snapshot(raion_ref, force=force_refresh)
+live_log = read_live_log()
 
-if mode == "Live API":
-    st.sidebar.info(live_status)
-    if live_df.empty:
-        st.sidebar.warning("Додаток працює на підготовлених CSV. Live API ще не активний.")
+if not live_snapshot.empty:
+    live_features = build_live_features(live_snapshot, live_log)
+    live_risk, prediction_status = predict_live_risk(
+        live_features,
+        model,
+        model_status,
+        latest_df,
+        risk_by_oblast_df,
+    )
 else:
-    st.sidebar.info("Режим історичного знімка. API реальних тривог ще не використовується.")
+    live_features = pd.DataFrame()
+    live_risk = pd.DataFrame()
+    prediction_status = "no live snapshot"
 
-show_missing_files(load_errors)
+live_oblast_summary = build_live_oblast_summary(live_risk)
 
-available_oblasts = sorted(latest_df["oblast"].dropna().unique()) if "oblast" in latest_df.columns and not latest_df.empty else []
-selected_oblast = st.sidebar.selectbox("Область", available_oblasts) if available_oblasts else None
+st.sidebar.info(live_status)
+st.sidebar.caption(prediction_status)
 
-if selected_oblast and not latest_df.empty:
-    available_raions = sorted(latest_df.loc[latest_df["oblast"] == selected_oblast, "raion"].dropna().unique())
+oblast_options = sorted(raion_ref["oblast"].dropna().unique()) if not raion_ref.empty else []
+selected_oblast = st.sidebar.selectbox("Область", oblast_options) if oblast_options else None
+
+if selected_oblast:
+    raion_options = sorted(raion_ref.loc[raion_ref["oblast"] == selected_oblast, "raion"].dropna().unique())
 else:
-    available_raions = []
+    raion_options = []
 
-selected_raion = st.sidebar.selectbox("Район", available_raions) if available_raions else None
-
+selected_raion = st.sidebar.selectbox("Район", raion_options) if raion_options else None
 
 st.title("📡 Ukraine Air Raid Raion Forecast")
 st.markdown(
     """
 <div class="small-note">
-Дослідницький додаток для аналізу повітряних тривог і оцінки ризику старту нової тривоги в районі протягом наступних 60 хвилин.
-Модель показує <b>оцінку ризику</b>, а не точну ймовірність і не офіційне попередження.
+Додаток показує live статус активних тривог, збирає знімки кожні 15 хвилин і дає приблизний risk score старту нової тривоги на 60 хвилин.
+Risk score — це оцінка ризику для ранжування, не точна ймовірність і не офіційне попередження.
 </div>
 """,
     unsafe_allow_html=True,
 )
 
-latest_ts = None
-if not latest_df.empty and "timestamp" in latest_df.columns:
-    latest_ts = latest_df["timestamp"].max()
+m1, m2, m3, m4, m5, m6 = st.columns(6)
 
-col1, col2, col3, col4, col5 = st.columns(5)
-col1.metric("Модель", "logistic_v3_final")
-col2.metric("Target", "start 60m")
-col3.metric("PR AUC test", "0.330")
-col4.metric("ROC AUC test", "0.812")
-col5.metric("Останній знімок", str(latest_ts) if latest_ts is not None else "—")
+current_ts = live_snapshot["timestamp"].max() if not live_snapshot.empty and "timestamp" in live_snapshot.columns else None
+active_raions = int(live_snapshot["is_alert_active"].sum()) if not live_snapshot.empty else 0
+active_oblasts = int(live_snapshot.loc[live_snapshot["is_alert_active"] == 1, "oblast"].nunique()) if not live_snapshot.empty else 0
+live_log_points = int(live_log["timestamp"].nunique()) if not live_log.empty and "timestamp" in live_log.columns else 0
+top_score = live_risk["risk_score"].max() if not live_risk.empty and "risk_score" in live_risk.columns else np.nan
+
+m1.metric("Live timestamp", str(current_ts) if current_ts is not None else "—")
+m2.metric("Активні райони", active_raions)
+m3.metric("Активні області", active_oblasts)
+m4.metric("Live знімків", live_log_points)
+m5.metric("Max live risk", fmt_score(top_score))
+m6.metric("Test PR AUC", "0.330")
 
 tabs = st.tabs(
     [
-        "Головний екран",
-        "Профіль району",
-        "Аналітика",
+        "Live моніторинг",
+        "Прогноз району",
+        "Інфографіка",
+        "Історія району",
         "Оцінка моделі",
         "Дані і обмеження",
     ]
 )
 
-
 with tabs[0]:
-    st.subheader("Головний екран")
+    st.subheader("Live моніторинг")
 
     st.markdown(
         """
-<div class="warning-box">
-<b>Режим історичного знімка.</b><br>
-API реальних тривог ще не підключено. Після додавання токена додаток зможе отримувати live статуси тривог.
-Зараз карта і таблиці працюють на підготовлених CSV файлах.
+<div class="danger-box">
+Це не офіційна карта тривог і не система безпеки. Для реальних рішень використовуй тільки офіційні джерела.
 </div>
 """,
         unsafe_allow_html=True,
     )
 
-    left, right = st.columns([1.45, 1.0])
+    left, right = st.columns([1.35, 1.0])
 
     with left:
-        st.plotly_chart(build_oblast_map(risk_by_oblast_df), use_container_width=True)
+        if not live_oblast_summary.empty:
+            st.plotly_chart(
+                build_oblast_panel(live_oblast_summary, "active_share", "Live: частка активних районів по областях"),
+                use_container_width=True,
+            )
+        elif not risk_by_oblast_df.empty:
+            st.plotly_chart(
+                build_oblast_panel(risk_by_oblast_df, "avg_predicted_risk", "Fallback: історичний risk score по областях"),
+                use_container_width=True,
+            )
+        else:
+            st.warning("Немає даних для мапи/панелі.")
 
     with right:
         st.markdown('<div class="main-card">', unsafe_allow_html=True)
-        st.subheader("Топ ризикових районів")
+        st.subheader("Активні зараз")
 
-        if latest_df.empty:
-            st.warning("Немає `latest_risk_snapshot.csv` або файл порожній.")
+        if live_risk.empty:
+            st.warning("Live risk snapshot порожній.")
         else:
-            show_cols = [c for c in ["timestamp", "oblast", "raion", "risk_score", "risk_rank", "risk_percentile", "risk_level", TARGET_NAME] if c in latest_df.columns]
-            top_risks = latest_df.sort_values("risk_score", ascending=False).head(15)[show_cols].copy()
-            if "risk_score" in top_risks.columns:
-                top_risks["risk_score"] = top_risks["risk_score"].map(lambda x: round(float(x), 4) if pd.notna(x) else x)
-            st.dataframe(top_risks, use_container_width=True, hide_index=True)
+            active_now = live_risk[live_risk["is_alert_active"] == 1].copy()
+            cols = [c for c in ["timestamp", "oblast", "raion", "source_level_now"] if c in active_now.columns]
+            st.dataframe(active_now[cols].head(40), use_container_width=True, hide_index=True)
 
         st.markdown("</div>", unsafe_allow_html=True)
 
-    st.divider()
+    st.plotly_chart(chart_top_live_risks(live_risk, 25), use_container_width=True)
+    st.plotly_chart(chart_live_active_history(live_log), use_container_width=True)
 
-    st.subheader("Вибраний район")
+with tabs[1]:
+    st.subheader("Прогноз району на 60 хвилин")
 
-    if not selected_oblast or not selected_raion or latest_df.empty:
+    if not selected_oblast or not selected_raion:
         st.info("Вибери область і район у боковому меню.")
+    elif live_risk.empty:
+        st.warning("Live risk snapshot ще не створено.")
     else:
-        selected_row = latest_df[
-            (latest_df["oblast"] == selected_oblast) & (latest_df["raion"] == selected_raion)
-        ].sort_values("timestamp").tail(1)
+        row = live_risk[
+            (live_risk["oblast"] == selected_oblast)
+            & (live_risk["raion"] == selected_raion)
+        ]
 
-        if selected_row.empty:
-            st.warning("Для вибраного району немає risk snapshot.")
+        if row.empty:
+            st.warning("Для вибраного району немає live-рядка.")
         else:
-            row = selected_row.iloc[0]
-            score = row.get("risk_score", pd.NA)
-            level = row.get("risk_level", risk_level_from_score(score))
+            row = row.iloc[0]
+            is_active = int(row.get("is_alert_active", 0))
+            score = row.get("risk_score", np.nan)
+            level = row.get("risk_level", "unknown")
             rank = row.get("risk_rank", "—")
+            mode = row.get("prediction_mode", "—")
 
             a, b, c, d = st.columns(4)
             a.metric("Область", selected_oblast)
             b.metric("Район", selected_raion)
-            c.metric("Risk score", format_score(score))
-            d.metric("Ранг ризику", str(rank))
+            c.metric("Статус", "активна тривога" if is_active else "немає активної")
+            d.metric("Risk rank", str(rank))
 
-            st.markdown(
-                f"Рівень ризику: {risk_html(level)}",
-                unsafe_allow_html=True,
-            )
-
-            if st.button("Спрогнозувати ризик на 60 хв", type="primary"):
-                st.success(
-                    f"Оцінка ризику для {selected_raion}: {format_score(score)}. "
-                    f"Інтерпретація: {risk_level_ua(level)} ризик старту нової тривоги протягом наступних 60 хвилин "
-                    f"відносно інших районів у цьому історичному знімку."
-                )
-                st.caption(
-                    "Це не точна ймовірність і не офіційне попередження. Модель використовується для ранжування ризику."
-                )
-
-    st.plotly_chart(build_top_raions_chart(latest_df), use_container_width=True)
-
-
-with tabs[1]:
-    st.subheader("Профіль району")
-
-    if not selected_oblast or not selected_raion:
-        st.info("Вибери область і район у боковому меню.")
-    else:
-        st.markdown(
-            f"""
-<div class="main-card">
-<b>Область:</b> {selected_oblast}<br>
-<b>Район:</b> {selected_raion}
+            if is_active:
+                st.markdown(
+                    f"""
+<div class="danger-box">
+У вибраному районі зараз активна тривога. Модель тренувалась прогнозувати <b>старт нової тривоги</b>,
+тому для активного району risk score старту не показується.
 </div>
 """,
-            unsafe_allow_html=True,
-        )
-
-        if intervals_df.empty:
-            st.warning("Немає `data/interim/raion_alert_intervals.csv`.")
-        else:
-            df = intervals_df.copy()
-            df = df[(df["oblast"] == selected_oblast) & (df["raion"] == selected_raion)].copy()
-
-            if df.empty:
-                st.warning("Для вибраного району немає інтервалів тривог.")
+                    unsafe_allow_html=True,
+                )
             else:
-                if "started_at" in df.columns:
-                    df["started_at"] = pd.to_datetime(df["started_at"], errors="coerce", utc=True)
-                if "finished_at" in df.columns:
-                    df["finished_at"] = pd.to_datetime(df["finished_at"], errors="coerce", utc=True)
-
-                if "duration_min" not in df.columns and {"started_at", "finished_at"}.issubset(df.columns):
-                    df["duration_min"] = (df["finished_at"] - df["started_at"]).dt.total_seconds() / 60
-
-                df = df.sort_values("started_at", ascending=False)
-
-                cols = [c for c in ["started_at", "finished_at", "duration_min", "source_level"] if c in df.columns]
-                st.subheader("Останні 10 тривог")
-                st.dataframe(df[cols].head(10), use_container_width=True, hide_index=True)
-
-                st.plotly_chart(
-                    build_raion_hour_starts(intervals_df, selected_oblast, selected_raion),
-                    use_container_width=True,
+                st.markdown(
+                    f"""
+<div class="main-card">
+<h3>Risk score на 60 хв: {fmt_score(score)}</h3>
+Рівень ризику: {risk_html(level)}<br>
+Режим прогнозу: <code>{mode}</code><br><br>
+Це приблизна оцінка ризику, побудована на моментних live-даних і live-історії, яку додаток накопичує під час роботи.
+</div>
+""",
+                    unsafe_allow_html=True,
                 )
 
+                if st.button("Спрогнозувати ризик на 60 хв", type="primary"):
+                    st.success(
+                        f"{selected_raion}: risk score = {fmt_score(score)}. "
+                        f"Інтерпретація: {risk_ua(level)} ризик старту нової тривоги протягом наступних 60 хвилин."
+                    )
+
+            with st.expander("Показати feature row для live-прогнозу"):
+                show_cols = [
+                    "timestamp",
+                    "oblast",
+                    "raion",
+                    "is_alert_active",
+                    "source_level_now",
+                    "hour",
+                    "day_of_week",
+                    "is_night",
+                    "starts_last_1h",
+                    "starts_last_3h",
+                    "starts_last_24h",
+                    "active_minutes_last_1h",
+                    "active_minutes_last_3h",
+                    "active_minutes_last_24h",
+                    "oblast_active_raions_now",
+                    "oblast_active_share_now",
+                    "live_history_hours_available",
+                    "risk_score",
+                    "risk_level",
+                    "prediction_mode",
+                ]
+                show_cols = [c for c in show_cols if c in live_risk.columns]
+                st.dataframe(live_risk.loc[[row.name], show_cols], use_container_width=True, hide_index=True)
 
 with tabs[2]:
-    st.subheader("Аналітика")
+    st.subheader("Інфографіка")
 
-    col_a, col_b = st.columns(2)
+    col1, col2 = st.columns(2)
 
-    with col_a:
-        if risk_by_oblast_df.empty:
-            st.warning("Немає `risk_by_oblast.csv`.")
-        else:
-            plot_df = risk_by_oblast_df.sort_values("avg_predicted_risk", ascending=True).tail(15)
+    with col1:
+        if not live_oblast_summary.empty:
+            plot = live_oblast_summary.sort_values("active_share", ascending=True).tail(15)
             fig = px.bar(
-                plot_df,
+                plot,
+                x="active_share",
+                y="oblast",
+                orientation="h",
+                color="active_share",
+                color_continuous_scale=["#22c55e", "#eab308", "#f97316", "#ef4444"],
+                title="Live: частка активних районів по областях",
+                labels={"active_share": "Active share", "oblast": "Область"},
+            )
+            fig.update_layout(template="plotly_dark", height=500, margin=dict(l=0, r=0, t=45, b=0))
+            st.plotly_chart(fig, use_container_width=True)
+
+    with col2:
+        if not live_oblast_summary.empty:
+            plot = live_oblast_summary.dropna(subset=["avg_live_risk"]).sort_values("avg_live_risk", ascending=True).tail(15)
+            fig = px.bar(
+                plot,
+                x="avg_live_risk",
+                y="oblast",
+                orientation="h",
+                color="avg_live_risk",
+                color_continuous_scale=["#22c55e", "#eab308", "#f97316", "#ef4444"],
+                title="Live: середній risk score неактивних районів",
+                labels={"avg_live_risk": "Risk score", "oblast": "Область"},
+            )
+            fig.update_layout(template="plotly_dark", height=500, margin=dict(l=0, r=0, t=45, b=0))
+            st.plotly_chart(fig, use_container_width=True)
+
+    st.divider()
+
+    col3, col4 = st.columns(2)
+
+    with col3:
+        if not risk_by_oblast_df.empty:
+            plot = risk_by_oblast_df.sort_values("avg_predicted_risk", ascending=True).tail(15)
+            fig = px.bar(
+                plot,
                 x="avg_predicted_risk",
                 y="oblast",
                 orientation="h",
                 color="avg_predicted_risk",
                 color_continuous_scale=["#22c55e", "#eab308", "#f97316", "#ef4444"],
-                title="Середній risk score по областях",
+                title="Історично: середній risk score по областях",
                 labels={"avg_predicted_risk": "Risk score", "oblast": "Область"},
             )
-            fig.update_layout(template="plotly_dark", height=520, margin=dict(l=0, r=0, t=45, b=0))
+            fig.update_layout(template="plotly_dark", height=500, margin=dict(l=0, r=0, t=45, b=0))
             st.plotly_chart(fig, use_container_width=True)
-
-    with col_b:
-        if risk_by_oblast_df.empty or "actual_positive_rate" not in risk_by_oblast_df.columns:
-            st.warning("Немає фактичної частки позитивних подій по областях.")
         else:
-            plot_df = risk_by_oblast_df.dropna(subset=["actual_positive_rate"]).sort_values("actual_positive_rate", ascending=True).tail(15)
+            st.warning("Немає risk_by_oblast.csv")
+
+    with col4:
+        if not risk_by_oblast_df.empty and "actual_positive_rate" in risk_by_oblast_df.columns:
+            plot = risk_by_oblast_df.dropna(subset=["actual_positive_rate"]).sort_values("actual_positive_rate", ascending=True).tail(15)
             fig = px.bar(
-                plot_df,
+                plot,
                 x="actual_positive_rate",
                 y="oblast",
                 orientation="h",
                 color="actual_positive_rate",
                 color_continuous_scale=["#334155", "#eab308", "#ef4444"],
-                title="Фактична частка позитивних подій по областях",
+                title="Історично: фактична частка positive target",
                 labels={"actual_positive_rate": "Positive rate", "oblast": "Область"},
             )
-            fig.update_layout(template="plotly_dark", height=520, margin=dict(l=0, r=0, t=45, b=0))
+            fig.update_layout(template="plotly_dark", height=500, margin=dict(l=0, r=0, t=45, b=0))
             st.plotly_chart(fig, use_container_width=True)
 
-    st.plotly_chart(build_hour_chart(risk_by_hour_df), use_container_width=True)
+    st.plotly_chart(chart_risk_by_hour(risk_by_hour_df), use_container_width=True)
 
-    if not prediction_sample_df.empty:
-        with st.expander("Приклад тестових прогнозів"):
-            st.dataframe(prediction_sample_df.head(200), use_container_width=True)
-
+    if not live_risk.empty:
+        risk_values = live_risk.loc[live_risk["is_alert_active"] == 0, "risk_score"].dropna()
+        if not risk_values.empty:
+            fig = px.histogram(
+                risk_values,
+                nbins=30,
+                title="Live: розподіл risk score серед неактивних районів",
+                labels={"value": "Risk score", "count": "Кількість"},
+            )
+            fig.update_layout(template="plotly_dark", height=420, margin=dict(l=0, r=0, t=45, b=0))
+            st.plotly_chart(fig, use_container_width=True)
 
 with tabs[3]:
+    st.subheader("Історія вибраного району")
+
+    if not selected_oblast or not selected_raion:
+        st.info("Вибери область і район у боковому меню.")
+    elif intervals_df.empty:
+        st.warning("Немає data/interim/raion_alert_intervals.csv")
+    else:
+        df = intervals_df[
+            (intervals_df["oblast"] == selected_oblast)
+            & (intervals_df["raion"] == selected_raion)
+        ].copy()
+
+        if df.empty:
+            st.warning("Для вибраного району немає історичних інтервалів.")
+        else:
+            df["started_at"] = pd.to_datetime(df["started_at"], errors="coerce", utc=True)
+            df["finished_at"] = pd.to_datetime(df["finished_at"], errors="coerce", utc=True)
+
+            if "duration_min" not in df.columns:
+                df["duration_min"] = (df["finished_at"] - df["started_at"]).dt.total_seconds() / 60
+
+            latest_alerts = df.sort_values("started_at", ascending=False)
+            show_cols = [c for c in ["started_at", "finished_at", "duration_min", "source_level"] if c in latest_alerts.columns]
+
+            a, b, c = st.columns(3)
+            a.metric("Історичних інтервалів", len(df))
+            b.metric("Середня тривалість", f"{df['duration_min'].mean():.1f} хв")
+            c.metric("Макс. тривалість", f"{df['duration_min'].max():.1f} хв")
+
+            st.subheader("Останні 10 тривог")
+            st.dataframe(latest_alerts[show_cols].head(10), use_container_width=True, hide_index=True)
+
+            st.plotly_chart(chart_raion_hour_starts(intervals_df, selected_oblast, selected_raion), use_container_width=True)
+
+            if "source_level" in df.columns:
+                counts = df["source_level"].fillna("unknown").value_counts().reset_index()
+                counts.columns = ["source_level", "count"]
+                fig = px.pie(
+                    counts,
+                    names="source_level",
+                    values="count",
+                    title="Типи джерела історичних інтервалів району",
+                )
+                fig.update_layout(template="plotly_dark", height=420)
+                st.plotly_chart(fig, use_container_width=True)
+
+with tabs[4]:
     st.subheader("Оцінка моделі")
 
-    m1, m2, m3, m4, m5, m6 = st.columns(6)
-    m1.metric("PR AUC", "0.330244")
-    m2.metric("ROC AUC", "0.812334")
-    m3.metric("Brier", "0.168278")
-    m4.metric("F1@0.5", "0.351705")
-    m5.metric("Precision top 10%", "0.362957")
-    m6.metric("Recall top 10%", "0.403474")
+    a, b, c, d, e, f = st.columns(6)
+    a.metric("PR AUC", "0.330244")
+    b.metric("ROC AUC", "0.812334")
+    c.metric("Brier", "0.168278")
+    d.metric("F1@0.5", "0.351705")
+    e.metric("Precision top 10%", "0.362957")
+    f.metric("Recall top 10%", "0.403474")
 
     st.markdown(
         """
@@ -802,25 +1459,25 @@ CatBoost тестувався, але не став фінальною моде�
 
     st.subheader("Фінальні метрики")
     if metrics_df.empty:
-        st.warning("Немає `final_model_metrics.csv`.")
+        st.warning("Немає final_model_metrics.csv")
     else:
         st.dataframe(metrics_df, use_container_width=True, hide_index=True)
 
     st.subheader("Порівняння моделей")
     if comparison_df.empty:
-        st.warning("Немає `final_model_comparison.csv`.")
+        st.warning("Немає final_model_comparison.csv")
     else:
         st.dataframe(comparison_df, use_container_width=True, hide_index=True)
 
         if {"model", "pr_auc"}.issubset(comparison_df.columns):
-            plot_df = comparison_df.copy()
-            if "split" in plot_df.columns:
-                plot_df = plot_df[plot_df["split"].astype(str).str.lower() == "test"].copy()
-                if plot_df.empty:
-                    plot_df = comparison_df.copy()
+            plot = comparison_df.copy()
+            if "split" in plot.columns:
+                test_plot = plot[plot["split"].astype(str).str.lower() == "test"].copy()
+                if not test_plot.empty:
+                    plot = test_plot
 
             fig = px.bar(
-                plot_df.sort_values("pr_auc", ascending=True),
+                plot.sort_values("pr_auc", ascending=True),
                 x="pr_auc",
                 y="model",
                 orientation="h",
@@ -829,51 +1486,66 @@ CatBoost тестувався, але не став фінальною моде�
                 title="PR AUC моделей",
                 labels={"pr_auc": "PR AUC", "model": "Модель"},
             )
-            fig.update_layout(template="plotly_dark", height=480, margin=dict(l=0, r=0, t=45, b=0))
+            fig.update_layout(template="plotly_dark", height=520, margin=dict(l=0, r=0, t=45, b=0))
             st.plotly_chart(fig, use_container_width=True)
 
-
-with tabs[4]:
+with tabs[5]:
     st.subheader("Дані і обмеження")
 
     st.markdown(
         """
 <div class="main-card">
-<h4>Що робить додаток</h4>
-Додаток показує дослідницьку оцінку ризику старту нової повітряної тривоги в районі протягом наступних 60 хвилин.
-Він працює на підготовлених CSV файлах і не потребує API токена для запуску.
+<h4>Що робить live mode</h4>
+Додаток кожні 15 хвилин отримує активні тривоги з API, приводить їх до районної сітки,
+зберігає знімок у <code>data/live/live_raion_snapshots.csv</code> і будує приблизний live risk score.
+</div>
+
+<div class="main-card">
+<h4>Чому прогноз приблизний</h4>
+Фінальна модель тренувалась на історичних features. У live mode перші години роботи доступні тільки моментні дані.
+Rolling features за 1/3/24 години стають кращими тільки після накопичення live log.
 </div>
 
 <div class="main-card">
 <h4>Критичні обмеження</h4>
 <ul>
 <li>Це не офіційна система безпеки.</li>
-<li>Це не заміна офіційних повідомлень про повітряну тривогу.</li>
+<li>Це не заміна офіційних повітряних тривог.</li>
 <li>Модель дає <b>risk score</b>, а не точну ймовірність.</li>
+<li>Для активних районів прогноз старту нової тривоги не показується, бо тривога вже активна.</li>
 <li>Датасет є <b>raion-level proxy dataset</b>.</li>
 <li>Частина історичних районних рядків успадкована з рівня області.</li>
-<li>Для реального часу потрібен токен alerts.in.ua API.</li>
-<li>Поки live API не підключений, додаток працює в режимі історичного знімка.</li>
+<li>Якщо модельний файл не знайдено, додаток використовує fallback scoring.</li>
 </ul>
-</div>
-
-<div class="main-card">
-<h4>Як буде працювати live mode</h4>
-Після додавання токена в <code>.env</code> функція <code>load_live_alerts()</code> зможе отримувати активні тривоги.
-Потім ці дані можна буде перетворити у той самий формат <code>timestamp + oblast + raion</code>, який використовує dashboard.
 </div>
 """,
         unsafe_allow_html=True,
     )
 
-    st.subheader("Статус live API")
-    st.code(live_status)
-
-    if not live_df.empty:
-        st.dataframe(live_df.head(100), use_container_width=True)
-
-    st.subheader("Очікувані файли")
-    expected = pd.DataFrame(
-        [{"file": str(path), "exists": path.exists()} for path in DATA_PATHS.values()]
+    st.subheader("Стан файлів")
+    files = pd.DataFrame(
+        [
+            {"file": str(path), "exists": path.exists()}
+            for path in list(DATA.values()) + [LIVE_SNAPSHOT_PATH, LIVE_RISK_PATH, LIVE_RAW_LAST_PATH]
+        ]
     )
-    st.dataframe(expected, use_container_width=True, hide_index=True)
+    st.dataframe(files, use_container_width=True, hide_index=True)
+
+    st.subheader("Live API status")
+    st.code(live_status)
+    st.code(prediction_status)
+
+    if LIVE_RAW_LAST_PATH.exists():
+        with st.expander("Остання raw API відповідь"):
+            try:
+                st.json(json.loads(LIVE_RAW_LAST_PATH.read_text(encoding="utf-8")))
+            except Exception:
+                st.text(LIVE_RAW_LAST_PATH.read_text(encoding="utf-8")[:5000])
+
+    if not live_log.empty:
+        with st.expander("Live log sample"):
+            st.dataframe(live_log.tail(300), use_container_width=True, hide_index=True)
+
+    if not live_risk.empty:
+        with st.expander("Live risk snapshot"):
+            st.dataframe(live_risk, use_container_width=True, hide_index=True)
